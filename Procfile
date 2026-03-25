@@ -1,0 +1,1 @@
+worker: python variational_gold_bot.py
