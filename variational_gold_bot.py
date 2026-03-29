@@ -1,13 +1,22 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 
@@ -18,6 +27,8 @@ CHAT_ID           = os.environ["CHAT_ID"]
 SPREAD_THRESHOLD  = float(os.getenv("SPREAD_THRESHOLD", "10.0"))
 FUNDING_THRESHOLD = float(os.getenv("FUNDING_THRESHOLD", "0.5"))
 CHECK_INTERVAL    = int(os.getenv("CHECK_INTERVAL", "60"))
+PNL_THRESHOLD     = float(os.getenv("PNL_THRESHOLD", "10.0"))
+PNL_MIN_HOURS     = float(os.getenv("PNL_MIN_HOURS", "24.0"))
 
 BASE_URL = "https://omni-client-api.prod.ap-northeast-1.variational.io"
 
@@ -28,6 +39,46 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+
+# ─── TRADE DATA MODEL ──────────────────────────────────────────────────────────
+
+@dataclass
+class Trade:
+    id: int
+    long_ticker: str
+    short_ticker: str
+    entry_long: float
+    entry_short: float
+    opened_at: datetime
+    pnl_alerted: bool = False
+
+    @property
+    def age_hours(self) -> float:
+        return (datetime.now(timezone.utc) - self.opened_at).total_seconds() / 3600
+
+    def pnl(self, mark_long: float, mark_short: float) -> float:
+        """
+        PnL non réalisé (hors funding) :
+        Long leg  : mark_long  - entry_long
+        Short leg : entry_short - mark_short
+        Total     : (mark_long - entry_long) + (entry_short - mark_short)
+        """
+        return (mark_long - self.entry_long) + (self.entry_short - mark_short)
+
+
+# ─── GLOBAL STATE ──────────────────────────────────────────────────────────────
+
+_trades: Dict[int, Trade] = {}
+_next_trade_id: int = 1
+
+_alert_sent_spread  = False
+_alert_sent_funding = False
+
+(
+    ASK_LONG,
+    ASK_ENTRY_LONG,
+    ASK_ENTRY_SHORT,
+) = range(3)
 
 # ─── API ───────────────────────────────────────────────────────────────────────
 
@@ -43,34 +94,25 @@ def fetch_gold_listings() -> dict:
         if ticker in ("XAUT", "PAXG"):
             result[ticker] = {
                 "mark_price":         float(listing["mark_price"]),
-                "funding_rate":       float(listing["funding_rate"]) * 100,  # as %
+                "funding_rate":       float(listing["funding_rate"]) * 100,
                 "funding_interval_s": listing.get("funding_interval_s", 28800),
                 "volume_24h":         float(listing["volume_24h"]),
             }
     return result
 
-# ─── MONITORING LOGIC ──────────────────────────────────────────────────────────
-
-# Track whether an alert has already been sent to prevent spam
-_alert_sent_spread  = False
-_alert_sent_funding = False
-
+# ─── ASYNC BRIDGE ──────────────────────────────────────────────────────────────
 
 def send_message_sync(loop: asyncio.AbstractEventLoop, bot, chat_id: str, text: str) -> None:
-    """
-    Bridge: envoie un message Telegram depuis un thread synchrone (APScheduler)
-    vers la boucle asyncio de python-telegram-bot.
-    Sans ça, app.bot.send_message() (coroutine) est créée mais jamais exécutée.
-    """
     future = asyncio.run_coroutine_threadsafe(
         bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown"),
         loop,
     )
     try:
-        future.result(timeout=10)  # bloque le thread APScheduler jusqu'à l'envoi
+        future.result(timeout=10)
     except Exception as e:
         log.error(f"Erreur envoi Telegram : {e}")
 
+# ─── MONITORING LOGIC ──────────────────────────────────────────────────────────
 
 def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
     global _alert_sent_spread, _alert_sent_funding
@@ -114,7 +156,6 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
             _alert_sent_spread = True
             log.info("✅ Spread alert sent.")
     else:
-        # Reset once the gap falls back below threshold
         _alert_sent_spread = False
 
     # ── Funding rate alert ─────────────────────────────────────────────────────
@@ -134,7 +175,219 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
     else:
         _alert_sent_funding = False
 
-# ─── TELEGRAM COMMANDS ─────────────────────────────────────────────────────────
+    # ── PnL alerts ────────────────────────────────────────────────────────────
+    prices = {"XAUT": xaut["mark_price"], "PAXG": paxg["mark_price"]}
+
+    for trade in list(_trades.values()):
+        if trade.pnl_alerted:
+            continue
+
+        mark_long  = prices[trade.long_ticker]
+        mark_short = prices[trade.short_ticker]
+        pnl        = trade.pnl(mark_long, mark_short)
+        age_h      = trade.age_hours
+
+        log.info(
+            f"Trade #{trade.id} | Long {trade.long_ticker} | Short {trade.short_ticker} | "
+            f"PnL={pnl:.2f}$ | Age={age_h:.1f}h"
+        )
+
+        if pnl >= PNL_THRESHOLD and age_h >= PNL_MIN_HOURS:
+            pnl_emoji = "🟢"
+            msg = (
+                f"{pnl_emoji} *PnL ALERT — Trade #{trade.id}* {pnl_emoji}\n\n"
+                f"Your trade is in profit after {age_h:.1f}h !\n\n"
+                f"┌ *Long* {trade.long_ticker}\n"
+                f"│  Entry : {trade.entry_long:.2f} $\n"
+                f"│  Mark   : {mark_long:.2f} $\n"
+                f"│  Gain   : +{(mark_long - trade.entry_long):.2f} $\n"
+                f"│\n"
+                f"├ *Short* {trade.short_ticker}\n"
+                f"│  Entry : {trade.entry_short:.2f} $\n"
+                f"│  Mark   : {mark_short:.2f} $\n"
+                f"│  Gain   : +{(trade.entry_short - mark_short):.2f} $\n"
+                f"│\n"
+                f"└ *Total pnl : +{pnl:.2f} $* 💰\n\n"
+                f"🕐 Opened on {trade.opened_at.strftime('%d/%m %H:%M')} UTC\n"
+                f"🕐 Now : {datetime.utcnow().strftime('%H:%M:%S')} UTC\n\n"
+                f"_Tape /closetrade {trade.id} to close this trade._"
+            )
+            send_message_sync(loop, app.bot, CHAT_ID, msg)
+            trade.pnl_alerted = True
+            log.info(f"✅ PnL alert sent for trade #{trade.id}.")
+
+# ─── COMMAND: /newtrade ────────────────────────────────────────────────────────
+
+async def cmd_newtrade_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    await update.message.reply_text(
+        "📝 *New trade — step 1 of 3*\n\n"
+        "Which instrument is in a *LONG* position?\n",
+        parse_mode="Markdown",
+    )
+    return ASK_LONG
+
+
+async def cmd_newtrade_long(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    answer = update.message.text.strip().upper()
+    if answer not in ("XAUT", "PAXG"):
+        await update.message.reply_text("❌ Answer `XAUT` or `PAXG`.", parse_mode="Markdown")
+        return ASK_LONG
+
+    ctx.user_data["long_ticker"]  = answer
+    ctx.user_data["short_ticker"] = "PAXG" if answer == "XAUT" else "XAUT"
+
+    await update.message.reply_text(
+        f"✅ Long : *{answer}* | Short : *{ctx.user_data['short_ticker']}*\n\n"
+        f"📝 *Step 2/3* — Entry fee for the *LONG* leg ({answer}) ?\n"
+        f"_(ex : 3215.50)_",
+        parse_mode="Markdown",
+    )
+    return ASK_ENTRY_LONG
+
+
+async def cmd_newtrade_entry_long(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        price = float(update.message.text.strip().replace(",", "."))
+        assert price > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ Enter a valid price (ex : 3215.50).")
+        return ASK_ENTRY_LONG
+
+    ctx.user_data["entry_long"] = price
+    short = ctx.user_data["short_ticker"]
+
+    await update.message.reply_text(
+        f"✅ Long entry : *{price:.2f} $*\n\n"
+        f"📝 *Step 3/3* — Entry fee for the *SHORT* leg ({short}) ?\n"
+        f"_(ex : 3210.00)_",
+        parse_mode="Markdown",
+    )
+    return ASK_ENTRY_SHORT
+
+
+async def cmd_newtrade_entry_short(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    global _next_trade_id
+
+    try:
+        price = float(update.message.text.strip().replace(",", "."))
+        assert price > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ Enter a valid price (ex : 3210.00).")
+        return ASK_ENTRY_SHORT
+
+    ctx.user_data["entry_short"] = price
+
+    trade = Trade(
+        id           = _next_trade_id,
+        long_ticker  = ctx.user_data["long_ticker"],
+        short_ticker = ctx.user_data["short_ticker"],
+        entry_long   = ctx.user_data["entry_long"],
+        entry_short  = ctx.user_data["entry_short"],
+        opened_at    = datetime.now(timezone.utc),
+    )
+    _trades[trade.id] = trade
+    _next_trade_id += 1
+
+    spread_entry = trade.entry_long - trade.entry_short
+
+    await update.message.reply_text(
+        f"✅ *Trade #{trade.id} saved !*\n\n"
+        f"┌ Long  *{trade.long_ticker}* @ {trade.entry_long:.2f} $\n"
+        f"└ Short *{trade.short_ticker}* @ {trade.entry_short:.2f} $\n\n"
+        f"Entry spread : *{spread_entry:+.2f} $*\n\n"
+        f"🔔 PnL alert if : ≥ +{PNL_THRESHOLD:.0f}$ after {PNL_MIN_HOURS:.0f}h\n"
+        f"🕐 Opened on {trade.opened_at.strftime('%d/%m/%Y à %H:%M')} UTC",
+        parse_mode="Markdown",
+    )
+    ctx.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cmd_newtrade_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.clear()
+    await update.message.reply_text("❌ Trade creation cancelled.")
+    return ConversationHandler.END
+
+# ─── COMMAND: /trades ──────────────────────────────────────────────────────────
+
+async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _trades:
+        await update.message.reply_text("📭 No open trades.")
+        return
+
+    try:
+        data   = fetch_gold_listings()
+        prices = {k: v["mark_price"] for k, v in data.items()}
+    except Exception:
+        prices = {}
+
+    lines = ["📋 *Open trades*\n"]
+    for trade in _trades.values():
+        mark_long  = prices.get(trade.long_ticker)
+        mark_short = prices.get(trade.short_ticker)
+
+        if mark_long and mark_short:
+            pnl     = trade.pnl(mark_long, mark_short)
+            pnl_str = f"{pnl:+.2f} $"
+            emoji   = "🟢" if pnl >= 0 else "🔴"
+        else:
+            pnl_str = "N/A"
+            emoji   = "⚪"
+
+        age_h = trade.age_hours
+        lines.append(
+            f"{emoji} *Trade #{trade.id}* | Long {trade.long_ticker} / Short {trade.short_ticker}\n"
+            f"   Entry : {trade.entry_long:.2f} / {trade.entry_short:.2f} $\n"
+            f"   Actual PnL : *{pnl_str}*\n"
+            f"   Age : {age_h:.1f}h | Alert sent : {'✅' if trade.pnl_alerted else '🕐'}\n"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+# ─── COMMAND: /closetrade <id> ─────────────────────────────────────────────────
+
+async def cmd_closetrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    args = ctx.args
+    if not args:
+        await update.message.reply_text(
+            "Usage : `/closetrade <id>`\nEx : `/closetrade 1`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        trade_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid ID.")
+        return
+
+    trade = _trades.pop(trade_id, None)
+    if trade is None:
+        await update.message.reply_text(f"❌ Trade #{trade_id} not found.")
+        return
+
+    try:
+        data       = fetch_gold_listings()
+        mark_long  = data[trade.long_ticker]["mark_price"]
+        mark_short = data[trade.short_ticker]["mark_price"]
+        pnl        = trade.pnl(mark_long, mark_short)
+        pnl_str    = f"{pnl:+.2f} $"
+        emoji      = "🟢" if pnl >= 0 else "🔴"
+    except Exception:
+        pnl_str = "N/A"
+        emoji   = "⚪"
+
+    await update.message.reply_text(
+        f"🗑 *Trade #{trade_id} closed*\n\n"
+        f"Long  {trade.long_ticker} @ {trade.entry_long:.2f} $\n"
+        f"Short {trade.short_ticker} @ {trade.entry_short:.2f} $\n\n"
+        f"{emoji} PnL at market close : *{pnl_str}*\n"
+        f"⏱ Duration : {trade.age_hours:.1f}h",
+        parse_mode="Markdown",
+    )
+
+# ─── EXISTING COMMANDS ─────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -144,7 +397,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Commands :\n"
         f"/price — Current price + spread\n"
         f"/threshold — View configured thresholds\n"
-        f"/status — Bot status",
+        f"/status — Bot status\n"
+        f"/newtrade — Create a trade to monitor\n"
+        f"/trades — List open trades\n"
+        f"/closetrade <id> — Close a trade",
         parse_mode="Markdown",
     )
 
@@ -190,6 +446,7 @@ async def cmd_seuil(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"⚙️ *Configured thresholds*\n\n"
         f"• Spread : *{SPREAD_THRESHOLD} $*\n"
         f"• Funding spread : *{FUNDING_THRESHOLD} %*\n"
+        f"• PnL alert : *+{PNL_THRESHOLD} $* after *{PNL_MIN_HOURS:.0f}h*\n"
         f"• Check interval : *{CHECK_INTERVAL}s*",
         parse_mode="Markdown",
     )
@@ -200,7 +457,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"✅ Bot now live\n"
         f"Check every {CHECK_INTERVAL}s\n"
         f"Spread alert sent : {'Yes' if _alert_sent_spread else 'No'}\n"
-        f"Funding alert sent : {'Yes' if _alert_sent_funding else 'No'}"
+        f"Funding alert sent : {'Yes' if _alert_sent_funding else 'No'}\n"
+        f"Trades open : {len(_trades)}"
     )
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
@@ -208,17 +466,26 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Register commands
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("price",     cmd_prix))
-    app.add_handler(CommandHandler("threshold", cmd_seuil))
-    app.add_handler(CommandHandler("status",    cmd_status))
+    newtrade_conv = ConversationHandler(
+        entry_points=[CommandHandler("newtrade", cmd_newtrade_start)],
+        states={
+            ASK_LONG:        [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_long)],
+            ASK_ENTRY_LONG:  [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_entry_long)],
+            ASK_ENTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_entry_short)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_newtrade_cancel)],
+    )
 
-    # On récupère la boucle asyncio AVANT de lancer run_polling,
-    # pour la passer au scheduler (qui tourne dans un thread séparé).
+    app.add_handler(newtrade_conv)
+    app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("price",      cmd_prix))
+    app.add_handler(CommandHandler("threshold",  cmd_seuil))
+    app.add_handler(CommandHandler("status",     cmd_status))
+    app.add_handler(CommandHandler("trades",     cmd_trades))
+    app.add_handler(CommandHandler("closetrade", cmd_closetrade))
+
     loop = asyncio.get_event_loop()
 
-    # Scheduler for automatic monitoring
     scheduler = BackgroundScheduler()
     scheduler.add_job(
         func=lambda: check_and_notify(app, loop),
@@ -229,7 +496,6 @@ def main() -> None:
     scheduler.start()
     log.info(f"🚀 Bot started — checking every {CHECK_INTERVAL}s")
 
-    # run_polling prend le contrôle de la boucle asyncio courante
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
