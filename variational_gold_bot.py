@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from datetime import datetime
@@ -55,7 +56,23 @@ _alert_sent_spread  = False
 _alert_sent_funding = False
 
 
-def check_and_notify(app: Application) -> None:
+def send_message_sync(loop: asyncio.AbstractEventLoop, bot, chat_id: str, text: str) -> None:
+    """
+    Bridge: envoie un message Telegram depuis un thread synchrone (APScheduler)
+    vers la boucle asyncio de python-telegram-bot.
+    Sans ça, app.bot.send_message() (coroutine) est créée mais jamais exécutée.
+    """
+    future = asyncio.run_coroutine_threadsafe(
+        bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown"),
+        loop,
+    )
+    try:
+        future.result(timeout=10)  # bloque le thread APScheduler jusqu'à l'envoi
+    except Exception as e:
+        log.error(f"Erreur envoi Telegram : {e}")
+
+
+def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
     global _alert_sent_spread, _alert_sent_funding
 
     try:
@@ -93,7 +110,7 @@ def check_and_notify(app: Application) -> None:
                 f"   Funding : {paxg['funding_rate']:.4f}% / {paxg['funding_interval_s']//3600}h\n\n"
                 f"🕐 {datetime.utcnow().strftime('%H:%M:%S')} UTC"
             )
-            app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            send_message_sync(loop, app.bot, CHAT_ID, msg)
             _alert_sent_spread = True
             log.info("✅ Spread alert sent.")
     else:
@@ -111,7 +128,7 @@ def check_and_notify(app: Application) -> None:
                 f"💡 Potential carry opportunity!\n"
                 f"🕐 {datetime.utcnow().strftime('%H:%M:%S')} UTC"
             )
-            app.bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+            send_message_sync(loop, app.bot, CHAT_ID, msg)
             _alert_sent_funding = True
             log.info("✅ Funding alert sent.")
     else:
@@ -125,7 +142,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"👋 XAUT/PAXG bot active !\n\n"
         f"Chat ID : `{chat_id}`\n\n"
         f"Commands :\n"
-        f"/price — Acutal price + spread\n"
+        f"/price — Current price + spread\n"
         f"/threshold — View configured thresholds\n"
         f"/status — Bot status",
         parse_mode="Markdown",
@@ -182,8 +199,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"✅ Bot now live\n"
         f"Check every {CHECK_INTERVAL}s\n"
-        f"Spread alert active : {'Yes' if _alert_sent_spread else 'No'}\n"
-        f"Funding alert active : {'Yes' if _alert_sent_funding else 'No'}"
+        f"Spread alert sent : {'Yes' if _alert_sent_spread else 'No'}\n"
+        f"Funding alert sent : {'Yes' if _alert_sent_funding else 'No'}"
     )
 
 # ─── MAIN ──────────────────────────────────────────────────────────────────────
@@ -192,15 +209,19 @@ def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Register commands
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("price",   cmd_prix))
-    app.add_handler(CommandHandler("threshold",  cmd_seuil))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("price",     cmd_prix))
+    app.add_handler(CommandHandler("threshold", cmd_seuil))
+    app.add_handler(CommandHandler("status",    cmd_status))
+
+    # On récupère la boucle asyncio AVANT de lancer run_polling,
+    # pour la passer au scheduler (qui tourne dans un thread séparé).
+    loop = asyncio.get_event_loop()
 
     # Scheduler for automatic monitoring
     scheduler = BackgroundScheduler()
     scheduler.add_job(
-        func=lambda: check_and_notify(app),
+        func=lambda: check_and_notify(app, loop),
         trigger="interval",
         seconds=CHECK_INTERVAL,
         id="gold_spread_check",
@@ -208,6 +229,7 @@ def main() -> None:
     scheduler.start()
     log.info(f"🚀 Bot started — checking every {CHECK_INTERVAL}s")
 
+    # run_polling prend le contrôle de la boucle asyncio courante
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
