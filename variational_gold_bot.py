@@ -49,21 +49,83 @@ class Trade:
     short_ticker: str
     entry_long: float
     entry_short: float
+    size: float
     opened_at: datetime
     pnl_alerted: bool = False
+
+    # Accumulated funding (in $), updated at each check_and_notify tick.
+    # Positive = received, Negative = paid.
+    # Convention: long position pays funding when rate > 0, receives when rate < 0.
+    #             short position is the opposite.
+    funding_long_accumulated: float = 0.0
+    funding_short_accumulated: float = 0.0
+
+    last_funding_update: Optional[datetime] = None
 
     @property
     def age_hours(self) -> float:
         return (datetime.now(timezone.utc) - self.opened_at).total_seconds() / 3600
 
-    def pnl(self, mark_long: float, mark_short: float) -> float:
+    def price_pnl(self, mark_long: float, mark_short: float) -> float:
+        """Unrealised price PnL (excluding funding), scaled by size."""
+        return self.size * (
+            (mark_long - self.entry_long) + (self.entry_short - mark_short)
+        )
+
+    @property
+    def funding_pnl(self) -> float:
+        """Total net funding received/paid so far (positive = net received)."""
+        return self.funding_long_accumulated + self.funding_short_accumulated
+
+    def total_pnl(self, mark_long: float, mark_short: float) -> float:
+        return self.price_pnl(mark_long, mark_short) + self.funding_pnl
+
+    def accrue_funding(
+        self,
+        funding_rate_long: float,   # % per funding_interval (e.g. 0.01 for 0.01%)
+        funding_rate_short: float,
+        mark_long: float,
+        mark_short: float,
+        funding_interval_long_s: int,
+        funding_interval_short_s: int,
+    ) -> None:
         """
-        PnL non réalisé (hors funding) :
-        Long leg  : mark_long  - entry_long
-        Short leg : entry_short - mark_short
-        Total     : (mark_long - entry_long) + (entry_short - mark_short)
+        Accumulate funding for the elapsed time since the last call.
+
+        Variational funding_rate is expressed as a percentage per funding_interval_s.
+        The payment for one tick is:  rate/100 * notional
+        where notional = size * mark_price.
+
+        We pro-rate by elapsed_seconds / funding_interval_s to handle
+        checks that don't align with funding intervals.
+
+        Sign convention (mirrors perpetuals):
+          - Long  pays +rate * notional  (negative for the holder when rate > 0)
+          - Short receives +rate * notional (positive for the holder when rate > 0)
         """
-        return (mark_long - self.entry_long) + (self.entry_short - mark_short)
+        now = datetime.now(timezone.utc)
+
+        if self.last_funding_update is None:
+            self.last_funding_update = now
+            return
+
+        elapsed_s = (now - self.last_funding_update).total_seconds()
+        self.last_funding_update = now
+
+        if elapsed_s <= 0:
+            return
+
+        # Long leg: longs pay when rate > 0, receive when rate < 0
+        notional_long = self.size * mark_long
+        rate_per_second_long = (funding_rate_long / 100) / funding_interval_long_s
+        funding_long_tick = -rate_per_second_long * notional_long * elapsed_s
+        self.funding_long_accumulated += funding_long_tick
+
+        # Short leg: shorts receive when rate > 0, pay when rate < 0
+        notional_short = self.size * mark_short
+        rate_per_second_short = (funding_rate_short / 100) / funding_interval_short_s
+        funding_short_tick = +rate_per_second_short * notional_short * elapsed_s
+        self.funding_short_accumulated += funding_short_tick
 
 
 # ─── GLOBAL STATE ──────────────────────────────────────────────────────────────
@@ -76,9 +138,10 @@ _alert_sent_funding = False
 
 (
     ASK_LONG,
+    ASK_SIZE,
     ASK_ENTRY_LONG,
     ASK_ENTRY_SHORT,
-) = range(3)
+) = range(4)
 
 # ─── API ───────────────────────────────────────────────────────────────────────
 
@@ -110,7 +173,7 @@ def send_message_sync(loop: asyncio.AbstractEventLoop, bot, chat_id: str, text: 
     try:
         future.result(timeout=10)
     except Exception as e:
-        log.error(f"Erreur envoi Telegram : {e}")
+        log.error(f"Telegram send error: {e}")
 
 # ─── MONITORING LOGIC ──────────────────────────────────────────────────────────
 
@@ -175,42 +238,64 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
     else:
         _alert_sent_funding = False
 
-    # ── PnL alerts ────────────────────────────────────────────────────────────
-    prices = {"XAUT": xaut["mark_price"], "PAXG": paxg["mark_price"]}
+    # ── Funding accrual + PnL alerts ──────────────────────────────────────────
+    rates = {
+        "XAUT": (xaut["funding_rate"], xaut["funding_interval_s"], xaut["mark_price"]),
+        "PAXG": (paxg["funding_rate"], paxg["funding_interval_s"], paxg["mark_price"]),
+    }
 
     for trade in list(_trades.values()):
+        long_rate,  long_interval_s,  mark_long  = rates[trade.long_ticker]
+        short_rate, short_interval_s, mark_short = rates[trade.short_ticker]
+
+        # Accrue funding for this tick
+        trade.accrue_funding(
+            funding_rate_long=long_rate,
+            funding_rate_short=short_rate,
+            mark_long=mark_long,
+            mark_short=mark_short,
+            funding_interval_long_s=long_interval_s,
+            funding_interval_short_s=short_interval_s,
+        )
+
+        price_pnl = trade.price_pnl(mark_long, mark_short)
+        total_pnl = trade.total_pnl(mark_long, mark_short)
+        age_h     = trade.age_hours
+
+        log.info(
+            f"Trade #{trade.id} | Long {trade.long_ticker} x{trade.size} | "
+            f"Short {trade.short_ticker} x{trade.size} | "
+            f"PricePnL={price_pnl:.2f}$ | Funding={trade.funding_pnl:.2f}$ | "
+            f"Total={total_pnl:.2f}$ | Age={age_h:.1f}h"
+        )
+
         if trade.pnl_alerted:
             continue
 
-        mark_long  = prices[trade.long_ticker]
-        mark_short = prices[trade.short_ticker]
-        pnl        = trade.pnl(mark_long, mark_short)
-        age_h      = trade.age_hours
-
-        log.info(
-            f"Trade #{trade.id} | Long {trade.long_ticker} | Short {trade.short_ticker} | "
-            f"PnL={pnl:.2f}$ | Age={age_h:.1f}h"
-        )
-
-        if pnl >= PNL_THRESHOLD and age_h >= PNL_MIN_HOURS:
+        if total_pnl >= PNL_THRESHOLD and age_h >= PNL_MIN_HOURS:
             pnl_emoji = "🟢"
+            f_long_sign  = "+" if trade.funding_long_accumulated >= 0 else ""
+            f_short_sign = "+" if trade.funding_short_accumulated >= 0 else ""
             msg = (
                 f"{pnl_emoji} *PnL ALERT — Trade #{trade.id}* {pnl_emoji}\n\n"
-                f"Your trade is in profit after {age_h:.1f}h !\n\n"
+                f"Size : *{trade.size} token(s)*\n"
+                f"Duration : *{age_h:.1f}h*\n\n"
                 f"┌ *Long* {trade.long_ticker}\n"
                 f"│  Entry : {trade.entry_long:.2f} $\n"
-                f"│  Mark   : {mark_long:.2f} $\n"
-                f"│  Gain   : +{(mark_long - trade.entry_long):.2f} $\n"
+                f"│  Mark  : {mark_long:.2f} $\n"
+                f"│  Price gain : {(mark_long - trade.entry_long) * trade.size:+.2f} $\n"
+                f"│  Funding    : {f_long_sign}{trade.funding_long_accumulated:.2f} $\n"
                 f"│\n"
                 f"├ *Short* {trade.short_ticker}\n"
                 f"│  Entry : {trade.entry_short:.2f} $\n"
-                f"│  Mark   : {mark_short:.2f} $\n"
-                f"│  Gain   : +{(trade.entry_short - mark_short):.2f} $\n"
+                f"│  Mark  : {mark_short:.2f} $\n"
+                f"│  Price gain : {(trade.entry_short - mark_short) * trade.size:+.2f} $\n"
+                f"│  Funding    : {f_short_sign}{trade.funding_short_accumulated:.2f} $\n"
                 f"│\n"
-                f"└ *Total pnl : +{pnl:.2f} $* 💰\n\n"
-                f"🕐 Opened on {trade.opened_at.strftime('%d/%m %H:%M')} UTC\n"
-                f"🕐 Now : {datetime.utcnow().strftime('%H:%M:%S')} UTC\n\n"
-                f"_Tape /closetrade {trade.id} to close this trade._"
+                f"├ Price PnL  : *{price_pnl:+.2f} $*\n"
+                f"├ Funding    : *{trade.funding_pnl:+.2f} $*\n"
+                f"└ *Total PnL : {total_pnl:+.2f} $* 💰\n\n"
+                f"🕐 Opened {trade.opened_at.strftime('%d/%m %H:%M')} UTC"
             )
             send_message_sync(loop, app.bot, CHAT_ID, msg)
             trade.pnl_alerted = True
@@ -221,8 +306,9 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
 async def cmd_newtrade_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     ctx.user_data.clear()
     await update.message.reply_text(
-        "📝 *New trade — step 1 of 3*\n\n"
-        "Which instrument is in a *LONG* position?\n",
+        "📝 *New trade — step 1 of 4*\n\n"
+        "Which instrument is in a *LONG* position?\n"
+        "Reply `XAUT` or `PAXG`.",
         parse_mode="Markdown",
     )
     return ASK_LONG
@@ -239,8 +325,28 @@ async def cmd_newtrade_long(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
 
     await update.message.reply_text(
         f"✅ Long : *{answer}* | Short : *{ctx.user_data['short_ticker']}*\n\n"
-        f"📝 *Step 2/3* — Entry fee for the *LONG* leg ({answer}) ?\n"
-        f"_(ex : 3215.50)_",
+        f"📝 *Step 2/4* — How many tokens did you trade?\n"
+        f"_(ex: `1`, `0.5`, `2.3`)_",
+        parse_mode="Markdown",
+    )
+    return ASK_SIZE
+
+
+async def cmd_newtrade_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        size = float(update.message.text.strip().replace(",", "."))
+        assert size > 0
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ Enter a valid positive number (ex: `0.5`).", parse_mode="Markdown")
+        return ASK_SIZE
+
+    ctx.user_data["size"] = size
+    long = ctx.user_data["long_ticker"]
+
+    await update.message.reply_text(
+        f"✅ Size : *{size} token(s)*\n\n"
+        f"📝 *Step 3/4* — Entry price for the *LONG* leg ({long})?\n"
+        f"_(ex: `3215.50`)_",
         parse_mode="Markdown",
     )
     return ASK_ENTRY_LONG
@@ -251,7 +357,7 @@ async def cmd_newtrade_entry_long(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         price = float(update.message.text.strip().replace(",", "."))
         assert price > 0
     except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Enter a valid price (ex : 3215.50).")
+        await update.message.reply_text("❌ Enter a valid price (ex: `3215.50`).", parse_mode="Markdown")
         return ASK_ENTRY_LONG
 
     ctx.user_data["entry_long"] = price
@@ -259,8 +365,8 @@ async def cmd_newtrade_entry_long(update: Update, ctx: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(
         f"✅ Long entry : *{price:.2f} $*\n\n"
-        f"📝 *Step 3/3* — Entry fee for the *SHORT* leg ({short}) ?\n"
-        f"_(ex : 3210.00)_",
+        f"📝 *Step 4/4* — Entry price for the *SHORT* leg ({short})?\n"
+        f"_(ex: `3210.00`)_",
         parse_mode="Markdown",
     )
     return ASK_ENTRY_SHORT
@@ -273,7 +379,7 @@ async def cmd_newtrade_entry_short(update: Update, ctx: ContextTypes.DEFAULT_TYP
         price = float(update.message.text.strip().replace(",", "."))
         assert price > 0
     except (ValueError, AssertionError):
-        await update.message.reply_text("❌ Enter a valid price (ex : 3210.00).")
+        await update.message.reply_text("❌ Enter a valid price (ex: `3210.00`).", parse_mode="Markdown")
         return ASK_ENTRY_SHORT
 
     ctx.user_data["entry_short"] = price
@@ -282,6 +388,7 @@ async def cmd_newtrade_entry_short(update: Update, ctx: ContextTypes.DEFAULT_TYP
         id           = _next_trade_id,
         long_ticker  = ctx.user_data["long_ticker"],
         short_ticker = ctx.user_data["short_ticker"],
+        size         = ctx.user_data["size"],
         entry_long   = ctx.user_data["entry_long"],
         entry_short  = ctx.user_data["entry_short"],
         opened_at    = datetime.now(timezone.utc),
@@ -290,14 +397,16 @@ async def cmd_newtrade_entry_short(update: Update, ctx: ContextTypes.DEFAULT_TYP
     _next_trade_id += 1
 
     spread_entry = trade.entry_long - trade.entry_short
+    notional     = trade.size * ((trade.entry_long + trade.entry_short) / 2)
 
     await update.message.reply_text(
-        f"✅ *Trade #{trade.id} saved !*\n\n"
+        f"✅ *Trade #{trade.id} saved!*\n\n"
         f"┌ Long  *{trade.long_ticker}* @ {trade.entry_long:.2f} $\n"
         f"└ Short *{trade.short_ticker}* @ {trade.entry_short:.2f} $\n\n"
+        f"Size : *{trade.size} token(s)* (~{notional:,.0f} $ notional)\n"
         f"Entry spread : *{spread_entry:+.2f} $*\n\n"
-        f"🔔 PnL alert if : ≥ +{PNL_THRESHOLD:.0f}$ after {PNL_MIN_HOURS:.0f}h\n"
-        f"🕐 Opened on {trade.opened_at.strftime('%d/%m/%Y à %H:%M')} UTC",
+        f"🔔 PnL alert if total ≥ +{PNL_THRESHOLD:.0f}$ after {PNL_MIN_HOURS:.0f}h\n"
+        f"🕐 Opened {trade.opened_at.strftime('%d/%m/%Y at %H:%M')} UTC",
         parse_mode="Markdown",
     )
     ctx.user_data.clear()
@@ -317,30 +426,40 @@ async def cmd_trades(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        data   = fetch_gold_listings()
-        prices = {k: v["mark_price"] for k, v in data.items()}
+        data = fetch_gold_listings()
+        market = {k: v for k, v in data.items()}
     except Exception:
-        prices = {}
+        market = {}
 
     lines = ["📋 *Open trades*\n"]
     for trade in _trades.values():
-        mark_long  = prices.get(trade.long_ticker)
-        mark_short = prices.get(trade.short_ticker)
+        long_data  = market.get(trade.long_ticker)
+        short_data = market.get(trade.short_ticker)
 
-        if mark_long and mark_short:
-            pnl     = trade.pnl(mark_long, mark_short)
-            pnl_str = f"{pnl:+.2f} $"
-            emoji   = "🟢" if pnl >= 0 else "🔴"
+        if long_data and short_data:
+            mark_long  = long_data["mark_price"]
+            mark_short = short_data["mark_price"]
+            price_pnl  = trade.price_pnl(mark_long, mark_short)
+            fund_pnl   = trade.funding_pnl
+            total_pnl  = price_pnl + fund_pnl
+            emoji      = "🟢" if total_pnl >= 0 else "🔴"
+            pnl_block  = (
+                f"   Price PnL : *{price_pnl:+.2f} $*\n"
+                f"   Funding   : *{fund_pnl:+.2f} $*\n"
+                f"   Total PnL : *{total_pnl:+.2f} $*\n"
+            )
         else:
-            pnl_str = "N/A"
-            emoji   = "⚪"
+            emoji     = "⚪"
+            pnl_block = "   PnL : N/A\n"
 
         age_h = trade.age_hours
         lines.append(
-            f"{emoji} *Trade #{trade.id}* | Long {trade.long_ticker} / Short {trade.short_ticker}\n"
+            f"{emoji} *Trade #{trade.id}* | "
+            f"Long {trade.long_ticker} / Short {trade.short_ticker} | "
+            f"Size {trade.size}\n"
             f"   Entry : {trade.entry_long:.2f} / {trade.entry_short:.2f} $\n"
-            f"   Actual PnL : *{pnl_str}*\n"
-            f"   Age : {age_h:.1f}h | Alert sent : {'✅' if trade.pnl_alerted else '🕐'}\n"
+            + pnl_block +
+            f"   Age : {age_h:.1f}h | Alert : {'✅' if trade.pnl_alerted else '🕐'}\n"
         )
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -351,7 +470,7 @@ async def cmd_closetrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     args = ctx.args
     if not args:
         await update.message.reply_text(
-            "Usage : `/closetrade <id>`\nEx : `/closetrade 1`",
+            "Usage: `/closetrade <id>`\nEx: `/closetrade 1`",
             parse_mode="Markdown",
         )
         return
@@ -371,19 +490,24 @@ async def cmd_closetrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         data       = fetch_gold_listings()
         mark_long  = data[trade.long_ticker]["mark_price"]
         mark_short = data[trade.short_ticker]["mark_price"]
-        pnl        = trade.pnl(mark_long, mark_short)
-        pnl_str    = f"{pnl:+.2f} $"
-        emoji      = "🟢" if pnl >= 0 else "🔴"
+        price_pnl  = trade.price_pnl(mark_long, mark_short)
+        fund_pnl   = trade.funding_pnl
+        total_pnl  = price_pnl + fund_pnl
+        emoji      = "🟢" if total_pnl >= 0 else "🔴"
+        pnl_lines  = (
+            f"Price PnL : *{price_pnl:+.2f} $*\n"
+            f"Funding   : *{fund_pnl:+.2f} $*\n"
+            f"{emoji} *Total PnL : {total_pnl:+.2f} $*"
+        )
     except Exception:
-        pnl_str = "N/A"
-        emoji   = "⚪"
+        pnl_lines = "⚪ PnL : N/A"
 
     await update.message.reply_text(
         f"🗑 *Trade #{trade_id} closed*\n\n"
-        f"Long  {trade.long_ticker} @ {trade.entry_long:.2f} $\n"
-        f"Short {trade.short_ticker} @ {trade.entry_short:.2f} $\n\n"
-        f"{emoji} PnL at market close : *{pnl_str}*\n"
-        f"⏱ Duration : {trade.age_hours:.1f}h",
+        f"Long  {trade.long_ticker} x{trade.size} @ {trade.entry_long:.2f} $\n"
+        f"Short {trade.short_ticker} x{trade.size} @ {trade.entry_short:.2f} $\n\n"
+        + pnl_lines +
+        f"\n⏱ Duration : {trade.age_hours:.1f}h",
         parse_mode="Markdown",
     )
 
@@ -392,9 +516,9 @@ async def cmd_closetrade(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     await update.message.reply_text(
-        f"👋 XAUT/PAXG bot active !\n\n"
-        f"Chat ID : `{chat_id}`\n\n"
-        f"Commands :\n"
+        f"👋 XAUT/PAXG bot active!\n\n"
+        f"Chat ID: `{chat_id}`\n\n"
+        f"Commands:\n"
         f"/price — Current price + spread\n"
         f"/threshold — View configured thresholds\n"
         f"/status — Bot status\n"
@@ -409,7 +533,7 @@ async def cmd_prix(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         data = fetch_gold_listings()
     except Exception as e:
-        await update.message.reply_text(f"❌ API error : {e}")
+        await update.message.reply_text(f"❌ API error: {e}")
         return
 
     if "XAUT" not in data or "PAXG" not in data:
@@ -454,7 +578,7 @@ async def cmd_seuil(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"✅ Bot now live\n"
+        f"✅ Bot live\n"
         f"Check every {CHECK_INTERVAL}s\n"
         f"Spread alert sent : {'Yes' if _alert_sent_spread else 'No'}\n"
         f"Funding alert sent : {'Yes' if _alert_sent_funding else 'No'}\n"
@@ -470,6 +594,7 @@ def main() -> None:
         entry_points=[CommandHandler("newtrade", cmd_newtrade_start)],
         states={
             ASK_LONG:        [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_long)],
+            ASK_SIZE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_size)],
             ASK_ENTRY_LONG:  [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_entry_long)],
             ASK_ENTRY_SHORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cmd_newtrade_entry_short)],
         },
