@@ -117,13 +117,13 @@ class Trade:
 
         # Long leg: longs pay when rate > 0, receive when rate < 0
         notional_long = self.size * mark_long
-        rate_per_second_long = (funding_rate_long / 100) / funding_interval_long_s
+        rate_per_second_long = funding_rate_long / funding_interval_long_s
         funding_long_tick = -rate_per_second_long * notional_long * elapsed_s
         self.funding_long_accumulated += funding_long_tick
 
         # Short leg: shorts receive when rate > 0, pay when rate < 0
         notional_short = self.size * mark_short
-        rate_per_second_short = (funding_rate_short / 100) / funding_interval_short_s
+        rate_per_second_short = funding_rate_short / funding_interval_short_s
         funding_short_tick = +rate_per_second_short * notional_short * elapsed_s
         self.funding_short_accumulated += funding_short_tick
 
@@ -157,7 +157,7 @@ def fetch_gold_listings() -> dict:
         if ticker in ("XAUT", "PAXG"):
             result[ticker] = {
                 "mark_price":         float(listing["mark_price"]),
-                "funding_rate":       float(listing["funding_rate"]) * 100,
+                "funding_rate":       float(listing["funding_rate"]),
                 "funding_interval_s": listing.get("funding_interval_s", 28800),
                 "volume_24h":         float(listing["volume_24h"]),
             }
@@ -209,10 +209,10 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
                 f"🚨 *GOLD SPREAD ALERT* 🚨\n\n"
                 f"📈 Price gap : *{spread_price:.2f} $* ({direction})\n\n"
                 f"┌ *XAUT* : {xaut['mark_price']:.2f} $\n"
-                f"│  Funding : {xaut['funding_rate']:.4f}% / {xaut['funding_interval_s']//3600}h\n"
+                f"│  Funding : {xaut['funding_rate']*100:.4f}% / {xaut['funding_interval_s']//3600}h\n"
                 f"│\n"
                 f"└ *PAXG* : {paxg['mark_price']:.2f} $\n"
-                f"   Funding : {paxg['funding_rate']:.4f}% / {paxg['funding_interval_s']//3600}h\n\n"
+                f"   Funding : {paxg['funding_rate']*100:.4f}% / {paxg['funding_interval_s']//3600}h\n\n"
                 f"🕐 {datetime.utcnow().strftime('%H:%M:%S')} UTC"
             )
             send_message_sync(loop, app.bot, CHAT_ID, msg)
@@ -222,7 +222,7 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
         _alert_sent_spread = False
 
     # ── Funding rate alert ─────────────────────────────────────────────────────
-    if spread_funding >= FUNDING_THRESHOLD:
+    if spread_funding * 100 >= FUNDING_THRESHOLD:
         if not _alert_sent_funding:
             msg = (
                 f"⚡ *GOLD FUNDING ALERT* ⚡\n\n"
@@ -546,17 +546,17 @@ async def cmd_prix(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     spread_funding = abs(xaut["funding_rate"] - paxg["funding_rate"])
 
     emoji_spread  = "🔴" if spread >= SPREAD_THRESHOLD else "🟢"
-    emoji_funding = "🔴" if spread_funding >= FUNDING_THRESHOLD else "🟢"
+    emoji_funding = "🔴" if spread_funding * 100 >= FUNDING_THRESHOLD else "🟢"
 
     msg = (
         f"💰 *Gold price — Variational*\n\n"
         f"*XAUT*\n"
         f"  Mark : {xaut['mark_price']:.2f} $\n"
-        f"  Funding : {xaut['funding_rate']:.4f}% / {xaut['funding_interval_s']//3600}h\n"
+        f"  Funding : {xaut['funding_rate']*100:.4f}% / {xaut['funding_interval_s']//3600}h\n"
         f"  Vol 24h : {xaut['volume_24h']:,.0f} $\n\n"
         f"*PAXG*\n"
         f"  Mark : {paxg['mark_price']:.2f} $\n"
-        f"  Funding : {paxg['funding_rate']:.4f}% / {paxg['funding_interval_s']//3600}h\n"
+        f"  Funding : {paxg['funding_rate']*100:.4f}% / {paxg['funding_interval_s']//3600}h\n"
         f"  Vol 24h : {paxg['volume_24h']:,.0f} $\n\n"
         f"{emoji_spread} Spread : *{spread:.2f} $*\n"
         f"{emoji_funding} Δ Funding : *{spread_funding:.4f}%*\n\n"
