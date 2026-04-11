@@ -117,13 +117,13 @@ class Trade:
 
         # Long leg: longs pay when rate > 0, receive when rate < 0
         notional_long = self.size * mark_long
-        rate_per_second_long = funding_rate_long / funding_interval_long_s
+        rate_per_second_long = (funding_rate_long / 100) / funding_interval_long_s
         funding_long_tick = -rate_per_second_long * notional_long * elapsed_s
         self.funding_long_accumulated += funding_long_tick
 
         # Short leg: shorts receive when rate > 0, pay when rate < 0
         notional_short = self.size * mark_short
-        rate_per_second_short = funding_rate_short / funding_interval_short_s
+        rate_per_second_short = (funding_rate_short / 100) / funding_interval_short_s
         funding_short_tick = +rate_per_second_short * notional_short * elapsed_s
         self.funding_short_accumulated += funding_short_tick
 
@@ -198,7 +198,7 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
 
     log.info(
         f"XAUT={xaut['mark_price']:.2f} | PAXG={paxg['mark_price']:.2f} | "
-        f"Spread={spread_price:.2f}$ | ΔFunding={spread_funding:.4f}%"
+        f"Spread={spread_price:.2f}$ | ΔFunding={spread_funding*100:.4f}%"
     )
 
     # ── Price spread alert ─────────────────────────────────────────────────────
@@ -227,8 +227,8 @@ def check_and_notify(app: Application, loop: asyncio.AbstractEventLoop) -> None:
             msg = (
                 f"⚡ *GOLD FUNDING ALERT* ⚡\n\n"
                 f"📊 Funding gap : *{spread_funding:.4f}%*\n\n"
-                f"┌ *XAUT* : {xaut['funding_rate']:.4f}% / {xaut['funding_interval_s']//3600}h\n"
-                f"└ *PAXG* : {paxg['funding_rate']:.4f}% / {paxg['funding_interval_s']//3600}h\n\n"
+                f"┌ *XAUT* : {xaut['funding_rate']*100:.4f}% / {xaut['funding_interval_s']//3600}h\n"
+                f"└ *PAXG* : {paxg['funding_rate']*100:.4f}% / {paxg['funding_interval_s']//3600}h\n\n"
                 f"💡 Potential carry opportunity!\n"
                 f"🕐 {datetime.utcnow().strftime('%H:%M:%S')} UTC"
             )
